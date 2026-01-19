@@ -3,6 +3,39 @@ import os
 from typing import List, Dict, Optional
 
 
+def get_next_version(current_version: str, available_versions: List[str]) -> Optional[str]:
+    """
+    Calculates the next incremental Kubernetes version.
+    EKS only supports upgrading one minor version at a time.
+    
+    Args:
+        current_version: Current cluster version (e.g., "1.33")
+        available_versions: List of available versions sorted newest first
+        
+    Returns:
+        Next incremental version (e.g., "1.34") or None if already at latest
+    """
+    try:
+        # Parse current version
+        current_parts = current_version.split('.')
+        current_minor = int(current_parts[1])
+        
+        # Calculate next minor version
+        next_minor = current_minor + 1
+        target_version = f"1.{next_minor}"
+        
+        # Check if target version exists in available versions
+        if target_version in available_versions:
+            return target_version
+        
+        # If target doesn't exist, cluster is already at latest
+        return None
+        
+    except (IndexError, ValueError) as e:
+        print(f"Error parsing version {current_version}: {str(e)}")
+        return None
+
+
 def get_cluster_addons(eks_client, cluster_name: str) -> List[Dict]:
     """
     Retrieves all addons for a cluster with their configurations.
@@ -578,7 +611,10 @@ def lambda_handler(event, context):
     sns_topic_arn = os.environ['SNS_TOPIC_ARN']
     
     clusters = eks.list_clusters()['clusters']
-    latest_version = eks.describe_cluster_versions()['clusterVersions'][0]['clusterVersion']
+    
+    # Get all available versions
+    cluster_versions_response = eks.describe_cluster_versions()
+    available_versions = [v['clusterVersion'] for v in cluster_versions_response['clusterVersions']]
     
     results = []
     
@@ -597,9 +633,12 @@ def lambda_handler(event, context):
         
         # Initialize cluster result
         cluster_result = {'cluster': cluster_name}
-            
-        if latest_version <= current_version:
-            message = f"EKS cluster '{cluster_name}' is up to date \nCurrent version: {current_version}\nLatest version: {latest_version}"
+        
+        # Calculate next incremental version
+        next_version = get_next_version(current_version, available_versions)
+        
+        if not next_version:
+            message = f"EKS cluster '{cluster_name}' is up to date \nCurrent version: {current_version}\nLatest available: {available_versions[0]}"
             sns.publish(
                 TopicArn=sns_topic_arn,
                 Subject=f"EKS Cluster is up to date - {cluster_name}",
@@ -617,7 +656,7 @@ def lambda_handler(event, context):
             non_passing = [i for i in insights['insights'] if i['insightStatus']['status'] != 'PASSING']
             
             if non_passing:
-                message = f"EKS cluster '{cluster_name}' upgrade blocked: {len(non_passing)} failing insights\nCurrent version: {current_version}\nLatest version: {latest_version}"
+                message = f"EKS cluster '{cluster_name}' upgrade blocked: {len(non_passing)} failing insights\nCurrent version: {current_version}\nNext version: {next_version}"
                 sns.publish(
                     TopicArn=sns_topic_arn,
                     Subject=f"EKS Cluster Upgrade Blocked due to Potential Issue - {cluster_name}",
@@ -629,8 +668,8 @@ def lambda_handler(event, context):
             else:
                 # Upgrade if enabled
                 if os.environ.get('ENABLE_AUTO_UPGRADE') == 'true':
-                    eks.update_cluster_version(name=cluster_name, version=latest_version)
-                    message = f"EKS cluster '{cluster_name}' upgrade initiated: {current_version} → {latest_version}"
+                    eks.update_cluster_version(name=cluster_name, version=next_version)
+                    message = f"EKS cluster '{cluster_name}' upgrade initiated: {current_version} → {next_version}"
                     sns.publish(
                         TopicArn=sns_topic_arn,
                         Subject=f"EKS Cluster Upgrade Initiated - {cluster_name}",
@@ -638,7 +677,7 @@ def lambda_handler(event, context):
                     )
                     cluster_result['status'] = 'upgrading'
                 else:
-                    message = f"EKS cluster '{cluster_name}' upgrade available: {current_version} → {latest_version}"
+                    message = f"EKS cluster '{cluster_name}' upgrade available: {current_version} → {next_version}"
                     sns.publish(
                         TopicArn=sns_topic_arn,
                         Subject=f"EKS Cluster Upgrade Available for {cluster_name}",

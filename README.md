@@ -30,7 +30,7 @@ This project provides automated management of Amazon EKS clusters, including:
 
 ## Architecture
 
-![Architecture Diagram](./Amazon-EKS-Upgrade.png)
+![Architecture Diagram](./images/Amazon-EKS-Upgrade.png)
 
 The solution consists of two Lambda functions:
 
@@ -75,7 +75,7 @@ Production clusters are automatically skipped.
 
 ### Option 2: Manual Deployment
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment instructions.
+See [DEPLOYMENT.md](./docs/DEPLOYMENT.md) for detailed deployment instructions.
 
 ## Configuration
 
@@ -155,9 +155,9 @@ Actual costs vary based on number of clusters, addons, and node groups.
 
 ## Documentation
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) - Detailed deployment guide
-- [code.py](code.py) - Addon management Lambda source code
-- [nodegroup_code.py](nodegroup_code.py) - Node group management Lambda source code
+- [DEPLOYMENT.md](./docs/DEPLOYMENT.md) - Detailed deployment guide
+- [code.py](./scripts/code.py) - Addon management Lambda source code
+- [nodegroup_code.py](./scripts/nodegroup_code.py) - Node group management Lambda source code
 - [template.yaml](template.yaml) - CloudFormation template
 
 ## License

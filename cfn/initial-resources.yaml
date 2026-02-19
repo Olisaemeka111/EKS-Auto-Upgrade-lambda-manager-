@@ -489,6 +489,53 @@ Resources:
         Environment: !Ref Environment
         Name: !Sub '${Environment}-dev-nodegroup'
 
+  # ════════════════════════════════════════════════════════════════
+  #  CLUSTER AUTOSCALER IAM (IRSA)
+  # ════════════════════════════════════════════════════════════════
+
+  ClusterAutoscalerRole:
+    Type: AWS::IAM::Role
+    DependsOn: EKSDevCluster
+    Properties:
+      RoleName: !Sub '${Environment}-cluster-autoscaler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ClusterAutoscalerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:DescribeScalingActivities
+                  - autoscaling:DescribeTags
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:GetInstanceTypesFromInstanceRequirements
+                  - eks:DescribeNodegroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                Resource: !Sub 'arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
 Outputs:
   ArtifactBucketName:
     Description: S3 bucket name for deployment artifacts (use as S3_BUCKET in deploy workflow)
@@ -534,3 +581,9 @@ Outputs:
   NodeGroupName:
     Description: Managed node group name
     Value: !Sub '${Environment}-dev-nodegroup'
+
+  ClusterAutoscalerRoleArn:
+    Description: IAM role ARN for the Cluster Autoscaler
+    Value: !GetAtt ClusterAutoscalerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-autoscaler-role-arn'

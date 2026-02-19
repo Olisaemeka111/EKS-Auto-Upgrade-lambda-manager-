@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Bootstrap infrastructure for EKS Upgrade Automation.
-  Creates: S3 bucket for deployment artifacts, GitHub Actions OIDC provider,
-  deployer IAM role, and deployer IAM managed policy.
+  Creates: S3 bucket, GitHub OIDC provider, deployer IAM role,
+  VPC networking, EKS dev cluster with managed node group.
   Deploy this stack ONCE before using the main deploy.yml workflow.
 
 Parameters:
@@ -35,6 +35,42 @@ Parameters:
     Description: >-
       Create GitHub Actions OIDC provider. Set to false if your account
       already has a GitHub OIDC provider registered.
+
+  EKSClusterVersion:
+    Type: String
+    Default: '1.31'
+    Description: Kubernetes version for the EKS dev cluster
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the VPC
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for managed node group
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of worker nodes
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of worker nodes
+
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of worker nodes
 
 Conditions:
   HasCustomBucketName: !Not [!Equals [!Ref S3BucketName, '']]
@@ -270,6 +306,189 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-version-checker:*'
               - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-nodegroup-version-manager:*'
 
+  # ════════════════════════════════════════════════════════════════
+  #  VPC NETWORKING
+  # ════════════════════════════════════════════════════════════════
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-eks-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: automate-eks-upgrades
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-eks-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnets (across 2 AZs — required by EKS)
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-a'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-b'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ════════════════════════════════════════════════════════════════
+  #  EKS CLUSTER
+  # ════════════════════════════════════════════════════════════════
+
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-eks-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSServicePolicy'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${Environment} EKS cluster'
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-eks-cluster-sg'
+
+  EKSDevCluster:
+    Type: AWS::EKS::Cluster
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Name: !Sub '${Environment}-dev-cluster'
+      Version: !Ref EKSClusterVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub '${Environment}-dev-cluster'
+
+  # ════════════════════════════════════════════════════════════════
+  #  MANAGED NODE GROUP
+  # ════════════════════════════════════════════════════════════════
+
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-eks-nodegroup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DevNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSDevCluster
+    Properties:
+      ClusterName: !Sub '${Environment}-dev-cluster'
+      NodegroupName: !Sub '${Environment}-dev-nodegroup'
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref NodeDesiredSize
+        MinSize: !Ref NodeMinSize
+        MaxSize: !Ref NodeMaxSize
+      AmiType: AL2_x86_64
+      DiskSize: 20
+      Tags:
+        Environment: !Ref Environment
+        Name: !Sub '${Environment}-dev-nodegroup'
+
 Outputs:
   ArtifactBucketName:
     Description: S3 bucket name for deployment artifacts (use as S3_BUCKET in deploy workflow)
@@ -291,3 +510,27 @@ Outputs:
     Condition: ShouldCreateOIDCProvider
     Description: GitHub Actions OIDC provider ARN
     Value: !GetAtt GitHubOIDCProvider.Arn
+
+  VpcId:
+    Description: VPC ID for the EKS cluster
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
+
+  EKSClusterName:
+    Description: EKS dev cluster name (tagged for automation discovery)
+    Value: !Ref EKSDevCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-eks-cluster-name'
+
+  EKSClusterEndpoint:
+    Description: EKS cluster API endpoint
+    Value: !GetAtt EKSDevCluster.Endpoint
+
+  EKSClusterVersion:
+    Description: Kubernetes version running on the cluster
+    Value: !Ref EKSClusterVersion
+
+  NodeGroupName:
+    Description: Managed node group name
+    Value: !Sub '${Environment}-dev-nodegroup'

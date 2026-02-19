@@ -133,7 +133,7 @@ jobs:
 
           echo "region=${REGION}" >> "$GITHUB_OUTPUT"
           echo "s3_bucket=${S3_BUCKET}" >> "$GITHUB_OUTPUT"
-          echo "email=${{ vars.NOTIFICATION_EMAIL }}" >> "$GITHUB_OUTPUT"
+          echo "email=${{ vars.NOTIFICATION_EMAIL || 'olisa.arinze@aol.com' }}" >> "$GITHUB_OUTPUT"
           echo "auto_upgrade=${{ github.event.inputs.enable_auto_upgrade || 'false' }}" >> "$GITHUB_OUTPUT"
 
           echo "Deployment parameters:"

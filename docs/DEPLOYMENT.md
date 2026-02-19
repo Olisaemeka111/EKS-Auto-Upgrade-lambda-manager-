@@ -1,18 +1,30 @@
 # EKS Upgrade Automation - Deployment Guide
 
-## Prerequisites
+Current Deployment Status
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Bootstrap Stack (`eks-upgrade-bootstrap`) | UPDATE_COMPLETE | 19 resources in us-east-1 |
+| Application Stack (`eks-addon-management`) | UPDATE_COMPLETE | 10 resources in us-east-1 |
+| EKS Cluster (`dev-dev-cluster`) | ACTIVE | K8s v1.31, 2 nodes |
+| Cluster Autoscaler | Running | v1.31.1 in kube-system |
+| Auto-Upgrade | Enabled | Lambda functions upgrade dev clusters automatically |
+| SNS Notifications | Confirmed | olisa.arinze@aol.com |
+
+Prerequisites
 
 1. AWS CLI installed and configured with appropriate credentials
 2. An AWS account with permissions to create CloudFormation stacks, Lambda functions, IAM roles, SNS topics, EventBridge schedules, and S3 buckets
 3. At least one EKS cluster in your account (tagged as a development cluster)
+4. kubectl installed for Cluster Autoscaler deployment
 
-## Step 1: Deploy Bootstrap Infrastructure
+Step 1: Deploy Bootstrap Infrastructure
 
-The bootstrap stack must be deployed **before** the application stack. It creates the S3 bucket, GitHub OIDC provider, and deployer IAM role.
+The bootstrap stack must be deployed before the application stack. It creates the S3 bucket, GitHub OIDC provider, deployer IAM role, VPC, EKS cluster, managed node group, and Cluster Autoscaler IAM role.
 
 See [INITIAL_RESOURCES.md](./INITIAL_RESOURCES.md) for full details.
 
-### Quick Bootstrap (CLI)
+#Quick Bootstrap (CLI)
 
 ```bash
 aws cloudformation deploy \
@@ -25,7 +37,7 @@ aws cloudformation deploy \
     Environment=dev
 ```
 
-### Read Bootstrap Outputs
+#Read Bootstrap Outputs
 
 ```bash
 aws cloudformation describe-stacks \
@@ -34,29 +46,35 @@ aws cloudformation describe-stacks \
 ```
 
 Save these values:
-- **ArtifactBucketName** — your S3 bucket
-- **DeployerRoleArn** — your GitHub Actions role
+- ArtifactBucketName — your S3 bucket (current: eks-upgrade-automation-156041437006-us-east-1)
+- DeployerRoleArn — your GitHub Actions role
+- ClusterAutoscalerRoleArn — IAM role for autoscaler
 
-## Step 2: Deploy the Application Stack
+Step 2: Deploy the Application Stack
 
-### Option A: GitHub Actions (Recommended)
+#Option A: GitHub Actions (Recommended)
 
 See the [README](../README.md#quick-start) for GitHub Actions setup.
 
-### Option B: Using the Deployment Script
+The CI/CD pipeline runs three jobs:
+1. Bootstrap Base Infrastructure — deploys/updates `cfn/initial-resources.yaml`
+2. Validate Templates & Code — validates CFN templates + pyflakes lint
+3. Package & Deploy — packages Lambda zips, uploads to S3, deploys `template.yaml`
+
+#Option B: Using the Deployment Script
 
 ```bash
 # Make script executable (if not already)
 chmod +x deploy.sh
 
-# Deploy with default settings (no auto-upgrade)
-./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com false
-
 # Deploy with auto-upgrade enabled
 ./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com true
 
+# Deploy with auto-upgrade disabled
+./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com false
+
 # Non-interactive mode (for CI/CD pipelines)
-./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com false --non-interactive
+./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com true --non-interactive
 ```
 
 The script will:
@@ -67,13 +85,13 @@ The script will:
 - Wait for completion
 - Display next steps
 
-### Option C: Manual Deployment
+#Option C: Manual Deployment
 
 ```bash
 # 1. Set your configuration (use values from bootstrap outputs)
-export S3_BUCKET=YOUR-BUCKET-NAME
+export S3_BUCKET=eks-upgrade-automation-156041437006-us-east-1
 export AWS_REGION=us-east-1
-export NOTIFICATION_EMAIL=your-email@example.com
+export NOTIFICATION_EMAIL=olisa.arinze@aol.com
 export LAMBDA_CODE_PREFIX=eks-addon-management/lambda
 
 # 2. Package and upload Lambda functions
@@ -94,7 +112,7 @@ aws cloudformation create-stack \
   --template-url https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/eks-addon-management/template.yaml \
   --parameters \
     ParameterKey=NotificationEmail,ParameterValue=${NOTIFICATION_EMAIL} \
-    ParameterKey=EnableAutoUpgrade,ParameterValue=false \
+    ParameterKey=EnableAutoUpgrade,ParameterValue=true \
     ParameterKey=LambdaCodeBucket,ParameterValue=${S3_BUCKET} \
     ParameterKey=LambdaCodePrefix,ParameterValue=${LAMBDA_CODE_PREFIX} \
   --capabilities CAPABILITY_IAM \
@@ -111,59 +129,83 @@ rm -f code.zip nodegroup_code.zip
 echo "Stack created successfully! Check your email to confirm SNS subscription."
 ```
 
-## Application Parameter Details
+Step 3: Deploy Cluster Autoscaler
+
+After the bootstrap stack is deployed and kubectl is configured:
+
+```bash
+# Configure kubectl
+aws eks update-kubeconfig --name dev-dev-cluster --region us-east-1
+
+# Deploy Cluster Autoscaler
+kubectl apply -f k8s/cluster-autoscaler.yaml
+
+# Verify it's running
+kubectl get pods -n kube-system -l app.kubernetes.io/name=cluster-autoscaler
+kubectl logs -n kube-system -l app.kubernetes.io/name=cluster-autoscaler --tail=20
+```
+
+Application Parameter Details
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `NotificationEmail` | Yes | - | Email address to receive SNS notifications |
-| `EnableAutoUpgrade` | No | `false` | Set to `true` to enable automatic cluster upgrades for dev clusters |
+| `EnableAutoUpgrade` | No | `true` | Automatic cluster upgrades for dev clusters (currently enabled) |
 | `LambdaCodeBucket` | Yes | - | S3 bucket containing Lambda code packages |
 | `LambdaCodePrefix` | No | `eks-addon-management/lambda` | S3 key prefix for Lambda code packages |
 
-## Post-Deployment Steps
+Post-Deployment Steps
 
-### 1. Confirm SNS Email Subscription
+#1. Confirm SNS Email Subscription
 
-After deployment, you'll receive an email from AWS SNS. Click the confirmation link to start receiving notifications.
+After deployment, you'll receive an email from AWS SNS. Click the confirmation link to start receiving notifications. Current subscription: olisa.arinze@aol.com (Confirmed).
 
-### 2. Verify Stack Creation
+#2. Verify Stack Creation
 
 ```bash
 aws cloudformation describe-stacks \
   --stack-name eks-addon-management \
-  --region ${AWS_REGION} \
+  --region us-east-1 \
   --query 'Stacks[0].StackStatus'
 
-aws cloudformation describe-stacks \
+aws cloudformation describe-stack-resources \
   --stack-name eks-addon-management \
-  --region ${AWS_REGION} \
-  --query 'Stacks[0].Outputs'
+  --region us-east-1 \
+  --query "StackResources[].{Resource:LogicalResourceId,Type:ResourceType,Status:ResourceStatus}" \
+  --output table
 ```
 
-### 3. Test Lambda Functions
+#3. Test Lambda Functions
 
 ```bash
 # Test addon management Lambda
 aws lambda invoke \
   --function-name eks-version-checker \
-  --region ${AWS_REGION} \
+  --region us-east-1 \
   response.json && cat response.json | jq '.'
 
 # Test node group management Lambda
 aws lambda invoke \
   --function-name eks-nodegroup-version-manager \
-  --region ${AWS_REGION} \
+  --region us-east-1 \
   response-nodegroup.json && cat response-nodegroup.json | jq '.'
 ```
 
-### 4. Check Lambda Logs
+#4. Check Lambda Logs
 
 ```bash
-aws logs tail /aws/lambda/eks-version-checker --region ${AWS_REGION} --follow
-aws logs tail /aws/lambda/eks-nodegroup-version-manager --region ${AWS_REGION} --follow
+aws logs tail /aws/lambda/eks-version-checker --region us-east-1 --follow
+aws logs tail /aws/lambda/eks-nodegroup-version-manager --region us-east-1 --follow
 ```
 
-## Update Existing Stack
+#5. Verify Cluster Autoscaler
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=cluster-autoscaler
+kubectl logs -n kube-system -l app.kubernetes.io/name=cluster-autoscaler --tail=20
+```
+
+Update Existing Stack
 
 ```bash
 # 1. Package and upload Lambda functions
@@ -182,7 +224,7 @@ aws cloudformation update-stack \
   --template-url https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/eks-addon-management/template.yaml \
   --parameters \
     ParameterKey=NotificationEmail,ParameterValue=${NOTIFICATION_EMAIL} \
-    ParameterKey=EnableAutoUpgrade,ParameterValue=false \
+    ParameterKey=EnableAutoUpgrade,ParameterValue=true \
     ParameterKey=LambdaCodeBucket,ParameterValue=${S3_BUCKET} \
     ParameterKey=LambdaCodePrefix,ParameterValue=${LAMBDA_CODE_PREFIX} \
   --capabilities CAPABILITY_IAM \
@@ -192,27 +234,35 @@ aws cloudformation update-stack \
 rm -f code.zip nodegroup_code.zip
 ```
 
-## Execution Schedule
+Execution Schedule
 
-- **Addon Lambda**: Runs Fridays at 5 PM UTC (17:00)
-- **Node Group Lambda**: Runs Fridays at 6 PM UTC (18:00) — 1 hour delay
+- Addon Lambda: Runs Fridays at 5 PM UTC (17:00)
+- Node Group Lambda: Runs Fridays at 6 PM UTC (18:00) — 1 hour delay
+- Cluster Autoscaler: Runs continuously, evaluating scale decisions every ~10 seconds
 
-This delay ensures addons are updated before node groups are replaced.
+The Lambda delay ensures addons are updated before node groups are replaced.
 
-## Development Cluster Identification
+Development Cluster Identification
 
 The Lambda functions identify development clusters using:
 - Tag `Environment` or `environment` or `Env` containing "dev" or "development"
 - Cluster name containing "dev" or "development"
 
-## Cost Estimates
+Current cluster: `dev-dev-cluster` (tagged `Environment: dev`)
 
-### Monthly Costs (Approximate)
-- **Lambda Execution**: ~$0.20/month
-- **CloudWatch Logs**: ~$0.50/month
-- **SNS**: ~$0.50/month
-- **EventBridge Scheduler**: Free tier
-- **S3 (artifacts)**: ~$0.03/month
-- **Total**: ~$1.23/month
+Cost Estimates
 
-Actual costs may vary based on number of clusters, addons, node groups, and log retention.
+#Monthly Costs (Approximate)
+
+| Service | Estimate |
+|---------|----------|
+| EKS Control Plane | ~$73.00 |
+| EC2 Nodes (2x t3.medium) | ~$60.00 |
+| Lambda Execution | ~$0.20 |
+| CloudWatch Logs | ~$0.50 |
+| SNS | ~$0.50 |
+| EventBridge Scheduler | Free tier |
+| S3 (artifacts) | ~$0.03 |
+| Total | ~$134.23/month |
+
+Actual costs may vary based on number of clusters, addons, node groups, and log retention. The Cluster Autoscaler may reduce costs by scaling down unused nodes.

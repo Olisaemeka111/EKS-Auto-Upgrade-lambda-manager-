@@ -1,0 +1,22 @@
+# Lambda packages
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AWS
+response.json
+response-nodegroup.json
+
+# Environment
+.env

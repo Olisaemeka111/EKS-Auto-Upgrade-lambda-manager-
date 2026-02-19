@@ -1,6 +1,30 @@
-# EKS Addon Management - Quick Reference
+# EKS Upgrade Automation - Quick Reference
 
-## Deployment
+## Bootstrap (One-Time)
+
+### Deploy Bootstrap Stack
+```bash
+aws cloudformation deploy \
+  --template-file cfn/initial-resources.yaml \
+  --stack-name eks-upgrade-bootstrap \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    GitHubOrg=YOUR-GITHUB-ORG \
+    GitHubRepo=automate-eks-upgrades \
+    Environment=dev
+```
+
+### Get Bootstrap Outputs
+```bash
+aws cloudformation describe-stacks \
+  --stack-name eks-upgrade-bootstrap \
+  --query 'Stacks[0].Outputs'
+```
+
+## Application Deployment
+
+### Using GitHub Actions
+Push to `main` or trigger manually via **Actions > Deploy EKS Upgrade Automation > Run workflow**.
 
 ### Using Deployment Script
 ```bash
@@ -9,23 +33,34 @@
 
 ### Manual Deployment
 ```bash
-# 1. Set variables
+# 1. Set variables (use bootstrap output for S3_BUCKET)
 export S3_BUCKET=YOUR-BUCKET-NAME
 export AWS_REGION=us-east-1
 export NOTIFICATION_EMAIL=your-email@example.com
+export LAMBDA_CODE_PREFIX=eks-addon-management/lambda
 
-# 2. Upload template
+# 2. Package and upload Lambda code
+cd scripts && zip -j ../code.zip code.py && zip -j ../nodegroup_code.zip nodegroup_code.py && cd ..
+aws s3 cp code.zip s3://${S3_BUCKET}/${LAMBDA_CODE_PREFIX}/code.zip --region ${AWS_REGION}
+aws s3 cp nodegroup_code.zip s3://${S3_BUCKET}/${LAMBDA_CODE_PREFIX}/nodegroup_code.zip --region ${AWS_REGION}
+
+# 3. Upload template
 aws s3 cp template.yaml s3://${S3_BUCKET}/eks-addon-management/template.yaml --region ${AWS_REGION}
 
-# 3. Deploy
+# 4. Deploy
 aws cloudformation create-stack \
   --stack-name eks-addon-management \
   --template-url https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/eks-addon-management/template.yaml \
   --parameters \
     ParameterKey=NotificationEmail,ParameterValue=${NOTIFICATION_EMAIL} \
     ParameterKey=EnableAutoUpgrade,ParameterValue=false \
+    ParameterKey=LambdaCodeBucket,ParameterValue=${S3_BUCKET} \
+    ParameterKey=LambdaCodePrefix,ParameterValue=${LAMBDA_CODE_PREFIX} \
   --capabilities CAPABILITY_IAM \
   --region ${AWS_REGION}
+
+# 5. Clean up
+rm -f code.zip nodegroup_code.zip
 ```
 
 ## Testing
@@ -48,10 +83,7 @@ aws lambda invoke \
 
 ### View Logs
 ```bash
-# Addon Lambda logs
 aws logs tail /aws/lambda/eks-version-checker --region ${AWS_REGION} --follow
-
-# Node Group Lambda logs
 aws logs tail /aws/lambda/eks-nodegroup-version-manager --region ${AWS_REGION} --follow
 ```
 
@@ -59,41 +91,20 @@ aws logs tail /aws/lambda/eks-nodegroup-version-manager --region ${AWS_REGION} -
 
 ### Check Stack Status
 ```bash
-aws cloudformation describe-stacks \
-  --stack-name eks-addon-management \
-  --region ${AWS_REGION} \
-  --query 'Stacks[0].StackStatus'
+# Bootstrap stack
+aws cloudformation describe-stacks --stack-name eks-upgrade-bootstrap --query 'Stacks[0].StackStatus'
+
+# Application stack
+aws cloudformation describe-stacks --stack-name eks-addon-management --query 'Stacks[0].StackStatus'
 ```
 
-### Get Stack Outputs
+### Delete Stacks
 ```bash
-aws cloudformation describe-stacks \
-  --stack-name eks-addon-management \
-  --region ${AWS_REGION} \
-  --query 'Stacks[0].Outputs'
-```
+# Delete application stack first
+aws cloudformation delete-stack --stack-name eks-addon-management --region ${AWS_REGION}
 
-### Update Stack
-```bash
-# 1. Upload updated template
-aws s3 cp template.yaml s3://${S3_BUCKET}/eks-addon-management/template.yaml --region ${AWS_REGION}
-
-# 2. Update stack
-aws cloudformation update-stack \
-  --stack-name eks-addon-management \
-  --template-url https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/eks-addon-management/template.yaml \
-  --parameters \
-    ParameterKey=NotificationEmail,ParameterValue=${NOTIFICATION_EMAIL} \
-    ParameterKey=EnableAutoUpgrade,ParameterValue=false \
-  --capabilities CAPABILITY_IAM \
-  --region ${AWS_REGION}
-```
-
-### Delete Stack
-```bash
-aws cloudformation delete-stack \
-  --stack-name eks-addon-management \
-  --region ${AWS_REGION}
+# Then bootstrap (bucket has DeletionPolicy: Retain)
+aws cloudformation delete-stack --stack-name eks-upgrade-bootstrap --region ${AWS_REGION}
 ```
 
 ## Cluster Tagging
@@ -105,32 +116,12 @@ Environment: dev
 Env: development
 ```
 
-Or include "dev" in cluster name:
-- `my-dev-cluster`
-- `development-cluster`
+Or include "dev" in cluster name: `my-dev-cluster`
 
 ## Schedule
 
 - **Addon Lambda**: Fridays at 5 PM UTC (17:00)
 - **Node Group Lambda**: Fridays at 6 PM UTC (18:00)
-
-## Notification Types
-
-### Cluster
-- Up-to-date
-- Upgrade available
-- Upgrade blocked
-- Upgrade initiated
-
-### Addons
-- All up-to-date
-- X updated
-- X failed
-
-### Node Groups
-- All up-to-date
-- X updating
-- X failed
 
 ## Force Node Group Update
 
@@ -144,8 +135,10 @@ aws eks update-nodegroup-version \
 
 ## Troubleshooting
 
-### Template Size Error
-Upload to S3 first (template is 55,594 bytes, exceeds 51,200 limit)
+### Bootstrap Stack Fails
+- Check IAM permissions for CloudFormation, IAM, S3
+- If OIDC provider exists, re-deploy with `CreateOIDCProvider=false`
+- Check: `aws cloudformation describe-stack-events --stack-name eks-upgrade-bootstrap`
 
 ### No Notifications
 1. Confirm SNS subscription (check email)
@@ -158,19 +151,15 @@ Upload to S3 first (template is 55,594 bytes, exceeds 51,200 limit)
 - Node Group Lambda: 300 seconds
 - Check CloudWatch logs for bottlenecks
 
-## Cost Estimate
-
-~$1.20/month:
-- Lambda: $0.20
-- CloudWatch: $0.50
-- SNS: $0.50
-- EventBridge: Free
-
 ## Files
 
-- `template.yaml` - CloudFormation template
-- `code.py` - Addon Lambda source
-- `nodegroup_code.py` - Node Group Lambda source
-- `deploy.sh` - Deployment script
-- `DEPLOYMENT.md` - Full deployment guide
-- `README.md` - Project overview
+| File | Description |
+|------|-------------|
+| `cfn/initial-resources.yaml` | Bootstrap stack (S3, OIDC, deployer role) |
+| `template.yaml` | Application CloudFormation template |
+| `scripts/code.py` | Cluster + addon management Lambda |
+| `scripts/nodegroup_code.py` | Node group management Lambda |
+| `iam/deployer-policy.json` | Standalone deployer policy |
+| `deploy.sh` | CLI deployment script |
+| `.github/workflows/deploy.yml` | Main CI/CD pipeline |
+| `.github/workflows/predeploy.yml` | Bootstrap reusable workflow |

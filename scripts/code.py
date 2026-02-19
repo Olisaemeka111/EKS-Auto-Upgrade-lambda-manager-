@@ -1,6 +1,8 @@
 import boto3
 import os
+import time
 from typing import List, Dict, Optional
+from botocore.exceptions import ClientError
 
 
 def get_next_version(current_version: str, available_versions: List[str]) -> Optional[str]:
@@ -205,20 +207,43 @@ def compare_versions(version1: str, version2: str) -> str:
         return 'equal'
 
 
-def check_addon_update_available(eks_client, cluster_name: str, addon_name: str, 
+def retry_with_backoff(func, *args, max_retries=3, **kwargs):
+    """
+    Retry a function with exponential backoff for API throttling.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ['Throttling', 'TooManyRequestsException', 'RequestLimitExceeded']:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"API throttled, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    raise
+            else:
+                raise
+
+
+def check_addon_update_available(eks_client, cluster_name: str, addon_name: str,
                                   current_version: str, cluster_k8s_version: str) -> Optional[str]:
     """
     Checks if a newer addon version is available.
-    
+
     Args:
         eks_client: Boto3 EKS client
         cluster_name: Name of the EKS cluster
         addon_name: Name of the addon
         current_version: Currently installed version
         cluster_k8s_version: Kubernetes version of the cluster
-        
+
     Returns:
         Latest version string if update available, None if up-to-date or error
+
+    Raises:
+        ClientError: Re-raises throttling errors for retry handling
     """
     try:
         # Query available addon versions for the cluster's Kubernetes version
@@ -226,41 +251,41 @@ def check_addon_update_available(eks_client, cluster_name: str, addon_name: str,
             addonName=addon_name,
             kubernetesVersion=cluster_k8s_version
         )
-        
+
         # Get the list of addon versions
         addon_versions = response.get('addons', [])
-        
+
         if not addon_versions:
             print(f"No addon versions found for {addon_name} on Kubernetes {cluster_k8s_version}")
             return None
-        
+
         # Get the first addon entry (should be the only one for the specific addon name)
         addon_info = addon_versions[0]
         addon_version_infos = addon_info.get('addonVersions', [])
-        
+
         if not addon_version_infos:
             print(f"No version information available for addon {addon_name}")
             return None
-        
+
         # The first version in the list is the latest compatible version
         latest_version = addon_version_infos[0].get('addonVersion')
-        
+
         if not latest_version:
             print(f"Could not determine latest version for addon {addon_name}")
             return None
-        
+
         # Compare current version with latest version
         comparison = compare_versions(current_version, latest_version)
-        
+
         if comparison == 'older':
-            # Update is available
             return latest_version
         else:
-            # Already up-to-date or newer
             return None
-            
-    except Exception as e:
-        # Handle API errors gracefully
+
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ['Throttling', 'TooManyRequestsException', 'RequestLimitExceeded']:
+            raise  # Let retry_with_backoff handle throttling
         print(f"Error checking addon version for {addon_name} in cluster {cluster_name}: {str(e)}")
         return None
 
@@ -498,87 +523,36 @@ def process_cluster_addons(
             auth_config = extract_auth_config(addon_info)
             auth_type = auth_config.get('auth_type', 'none')
             addon_result['auth_type'] = auth_type
-            
-            # Check if update is available
-            latest_version = None
-            retry_count = 0
-            max_retries = 3
-            
-            while retry_count < max_retries:
-                try:
-                    latest_version = check_addon_update_available(
-                        eks_client,
-                        cluster_name,
-                        addon_name,
-                        current_version,
-                        cluster_k8s_version
-                    )
-                    break  # Success, exit retry loop
-                    
-                except Exception as e:
-                    error_str = str(e)
-                    # Check if it's a throttling error
-                    if 'ThrottlingException' in error_str or 'TooManyRequestsException' in error_str:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            # Exponential backoff: 1s, 2s, 4s
-                            import time
-                            wait_time = 2 ** (retry_count - 1)
-                            print(f"Throttling error for {addon_name}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
-                            time.sleep(wait_time)
-                        else:
-                            # Max retries reached
-                            raise
-                    else:
-                        # Non-throttling error, don't retry
-                        raise
-            
+
+            # Check if update is available (with retry for throttling)
+            latest_version = retry_with_backoff(
+                check_addon_update_available,
+                eks_client,
+                cluster_name,
+                addon_name,
+                current_version,
+                cluster_k8s_version
+            )
+
             if latest_version is None:
-                # Addon is up-to-date
                 addon_result['status'] = 'up_to_date'
                 addon_result['target_version'] = current_version
             else:
-                # Update is available, attempt to update
                 addon_result['target_version'] = latest_version
-                
-                # Perform update with retry logic for throttling
-                update_result = None
-                retry_count = 0
-                
-                while retry_count < max_retries:
-                    try:
-                        update_result = update_addon_with_auth_preservation(
-                            eks_client,
-                            cluster_name,
-                            addon_name,
-                            latest_version,
-                            auth_config
-                        )
-                        break  # Success, exit retry loop
-                        
-                    except Exception as e:
-                        error_str = str(e)
-                        # Check if it's a throttling error
-                        if 'ThrottlingException' in error_str or 'TooManyRequestsException' in error_str:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                # Exponential backoff: 1s, 2s, 4s
-                                import time
-                                wait_time = 2 ** (retry_count - 1)
-                                print(f"Throttling error updating {addon_name}, retrying in {wait_time}s (attempt {retry_count}/{max_retries})")
-                                time.sleep(wait_time)
-                            else:
-                                # Max retries reached
-                                raise
-                        else:
-                            # Non-throttling error, don't retry
-                            raise
-                
+
+                # Perform update (with retry for throttling)
+                update_result = retry_with_backoff(
+                    update_addon_with_auth_preservation,
+                    eks_client,
+                    cluster_name,
+                    addon_name,
+                    latest_version,
+                    auth_config
+                )
+
                 if update_result and update_result.get('success'):
-                    # Update initiated successfully
                     addon_result['status'] = 'updated'
                 else:
-                    # Update failed
                     addon_result['status'] = 'failed'
                     addon_result['error'] = update_result.get('error') if update_result else 'Unknown error'
         

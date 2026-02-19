@@ -1,0 +1,151 @@
+name: Bootstrap Base Infrastructure
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (dev, staging, prod)'
+        required: false
+        type: string
+        default: 'dev'
+      s3BucketName:
+        description: 'Explicit S3 bucket name (leave empty for auto-generated name)'
+        required: false
+        type: string
+        default: ''
+      createOIDCProvider:
+        description: 'Create GitHub OIDC provider (false if already exists)'
+        required: false
+        type: string
+        default: 'true'
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+    outputs:
+      bucket-name:
+        description: 'S3 bucket name for deployment artifacts'
+        value: ${{ jobs.bootstrap.outputs.bucket-name }}
+      deployer-role-arn:
+        description: 'Deployer IAM role ARN'
+        value: ${{ jobs.bootstrap.outputs.deployer-role-arn }}
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      s3BucketName:
+        description: 'Explicit S3 bucket name (leave empty for auto-generated)'
+        required: false
+        default: ''
+        type: string
+      gitHubOrg:
+        description: 'GitHub org/username for OIDC trust'
+        required: true
+        type: string
+      createOIDCProvider:
+        description: 'Create GitHub OIDC provider'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  STACK_NAME: eks-upgrade-bootstrap
+
+jobs:
+  bootstrap:
+    name: Deploy Bootstrap Stack
+    runs-on: ubuntu-latest
+    outputs:
+      bucket-name: ${{ steps.outputs.outputs.bucket-name }}
+      deployer-role-arn: ${{ steps.outputs.outputs.deployer-role-arn }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve GitHub org
+        id: resolve-org
+        run: |
+          # For workflow_call: extract org from GITHUB_REPOSITORY
+          # For workflow_dispatch: use the input
+          ORG="${{ inputs.gitHubOrg }}"
+          if [ -z "$ORG" ]; then
+            ORG="${GITHUB_REPOSITORY_OWNER}"
+          fi
+          echo "org=${ORG}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate bootstrap template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://cfn/initial-resources.yaml
+
+      - name: Deploy bootstrap CloudFormation stack
+        run: |
+          REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          ENV="${{ inputs.environment || 'dev' }}"
+          BUCKET="${{ inputs.s3BucketName }}"
+          ORG="${{ steps.resolve-org.outputs.org }}"
+          OIDC="${{ inputs.createOIDCProvider || 'true' }}"
+          REPO="${{ github.event.repository.name || 'automate-eks-upgrades' }}"
+
+          echo "Deploying bootstrap stack: ${STACK_NAME}"
+          echo "  Environment: ${ENV}"
+          echo "  GitHub Org:  ${ORG}"
+          echo "  Repository:  ${REPO}"
+          echo "  OIDC:        ${OIDC}"
+
+          aws cloudformation deploy \
+            --template-file cfn/initial-resources.yaml \
+            --stack-name "${STACK_NAME}" \
+            --parameter-overrides \
+              Environment="${ENV}" \
+              S3BucketName="${BUCKET}" \
+              GitHubOrg="${ORG}" \
+              GitHubRepo="${REPO}" \
+              CreateOIDCProvider="${OIDC}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "${REGION}" \
+            --no-fail-on-empty-changeset
+
+          echo "Bootstrap stack deployed successfully"
+
+      - name: Capture stack outputs
+        id: outputs
+        run: |
+          REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" \
+            --output text)
+
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='DeployerRoleArn'].OutputValue" \
+            --output text)
+
+          echo "bucket-name=${BUCKET_NAME}" >> "$GITHUB_OUTPUT"
+          echo "deployer-role-arn=${ROLE_ARN}" >> "$GITHUB_OUTPUT"
+
+          echo "## Bootstrap Outputs" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| S3 Bucket | ${BUCKET_NAME} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deployer Role ARN | ${ROLE_ARN} |" >> "$GITHUB_STEP_SUMMARY"

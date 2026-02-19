@@ -1,0 +1,244 @@
+name: Deploy EKS Upgrade Automation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'template.yaml'
+      - 'cfn/**'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/predeploy.yml'
+  workflow_dispatch:
+    inputs:
+      enable_auto_upgrade:
+        description: 'Enable automatic upgrades (true/false)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      createOIDCProvider:
+        description: 'Create GitHub OIDC provider (false if already exists)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  STACK_NAME: eks-addon-management
+  LAMBDA_CODE_PREFIX: eks-addon-management/lambda
+
+jobs:
+  # ── Step 1: Bootstrap base infrastructure ──────────────────────
+  bootstrap:
+    name: Bootstrap Base Infrastructure
+    uses: ./.github/workflows/predeploy.yml
+    with:
+      environment: ${{ github.event.inputs.environment || 'dev' }}
+      s3BucketName: ${{ vars.S3_BUCKET || '' }}
+      createOIDCProvider: ${{ github.event.inputs.createOIDCProvider || 'false' }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+  # ── Step 2: Validate templates and code ────────────────────────
+  validate:
+    name: Validate Templates & Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Validate CloudFormation templates
+        run: |
+          echo "Validating main template..."
+          aws cloudformation validate-template \
+            --template-body file://template.yaml
+
+          echo "Validating bootstrap template..."
+          aws cloudformation validate-template \
+            --template-body file://cfn/initial-resources.yaml
+
+      - name: Lint Python scripts
+        run: |
+          pip install pyflakes
+          pyflakes scripts/code.py
+          pyflakes scripts/nodegroup_code.py
+
+  # ── Step 3: Package and deploy ─────────────────────────────────
+  deploy:
+    name: Package & Deploy
+    needs: [bootstrap, validate]
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Set deployment parameters
+        id: params
+        run: |
+          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
+
+          # Prefer bucket from bootstrap, fall back to vars.S3_BUCKET
+          BOOTSTRAP_BUCKET="${{ needs.bootstrap.outputs.bucket-name }}"
+          if [ -n "$BOOTSTRAP_BUCKET" ] && [ "$BOOTSTRAP_BUCKET" != 'null' ] && [ "$BOOTSTRAP_BUCKET" != 'None' ]; then
+            S3_BUCKET="$BOOTSTRAP_BUCKET"
+          else
+            S3_BUCKET="${{ vars.S3_BUCKET }}"
+          fi
+
+          if [ -z "$S3_BUCKET" ]; then
+            echo "ERROR: No S3 bucket available. Ensure bootstrap ran or set vars.S3_BUCKET"
+            exit 1
+          fi
+
+          echo "region=${REGION}" >> "$GITHUB_OUTPUT"
+          echo "s3_bucket=${S3_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "email=${{ vars.NOTIFICATION_EMAIL }}" >> "$GITHUB_OUTPUT"
+          echo "auto_upgrade=${{ github.event.inputs.enable_auto_upgrade || 'false' }}" >> "$GITHUB_OUTPUT"
+
+          echo "Deployment parameters:"
+          echo "  Region:       ${REGION}"
+          echo "  S3 Bucket:    ${S3_BUCKET}"
+          echo "  Auto-Upgrade: ${{ github.event.inputs.enable_auto_upgrade || 'false' }}"
+
+      - name: Package Lambda functions
+        run: |
+          cd scripts
+          zip -j ../code.zip code.py
+          zip -j ../nodegroup_code.zip nodegroup_code.py
+          cd ..
+          echo "Lambda packages created:"
+          ls -la code.zip nodegroup_code.zip
+
+      - name: Upload Lambda packages to S3
+        run: |
+          REGION="${{ steps.params.outputs.region }}"
+          BUCKET="${{ steps.params.outputs.s3_bucket }}"
+
+          aws s3 cp code.zip \
+            "s3://${BUCKET}/${LAMBDA_CODE_PREFIX}/code.zip" \
+            --region "${REGION}"
+
+          aws s3 cp nodegroup_code.zip \
+            "s3://${BUCKET}/${LAMBDA_CODE_PREFIX}/nodegroup_code.zip" \
+            --region "${REGION}"
+
+          echo "Lambda packages uploaded to s3://${BUCKET}/${LAMBDA_CODE_PREFIX}/"
+
+      - name: Upload CloudFormation template to S3
+        run: |
+          REGION="${{ steps.params.outputs.region }}"
+          BUCKET="${{ steps.params.outputs.s3_bucket }}"
+
+          aws s3 cp template.yaml \
+            "s3://${BUCKET}/eks-addon-management/template.yaml" \
+            --region "${REGION}"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          REGION="${{ steps.params.outputs.region }}"
+          BUCKET="${{ steps.params.outputs.s3_bucket }}"
+          EMAIL="${{ steps.params.outputs.email }}"
+          AUTO_UPGRADE="${{ steps.params.outputs.auto_upgrade }}"
+          TEMPLATE_URL="https://${BUCKET}.s3.${REGION}.amazonaws.com/eks-addon-management/template.yaml"
+
+          # Check if stack exists
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${REGION}" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [ "${STACK_STATUS}" = "DOES_NOT_EXIST" ]; then
+            echo "Creating new stack: ${STACK_NAME}"
+            aws cloudformation create-stack \
+              --stack-name "${STACK_NAME}" \
+              --template-url "${TEMPLATE_URL}" \
+              --parameters \
+                ParameterKey=NotificationEmail,ParameterValue="${EMAIL}" \
+                ParameterKey=EnableAutoUpgrade,ParameterValue="${AUTO_UPGRADE}" \
+                ParameterKey=LambdaCodeBucket,ParameterValue="${BUCKET}" \
+                ParameterKey=LambdaCodePrefix,ParameterValue="${LAMBDA_CODE_PREFIX}" \
+              --capabilities CAPABILITY_IAM \
+              --region "${REGION}"
+
+            echo "Waiting for stack creation..."
+            aws cloudformation wait stack-create-complete \
+              --stack-name "${STACK_NAME}" \
+              --region "${REGION}"
+          else
+            echo "Updating existing stack: ${STACK_NAME} (current status: ${STACK_STATUS})"
+            aws cloudformation update-stack \
+              --stack-name "${STACK_NAME}" \
+              --template-url "${TEMPLATE_URL}" \
+              --parameters \
+                ParameterKey=NotificationEmail,ParameterValue="${EMAIL}" \
+                ParameterKey=EnableAutoUpgrade,ParameterValue="${AUTO_UPGRADE}" \
+                ParameterKey=LambdaCodeBucket,ParameterValue="${BUCKET}" \
+                ParameterKey=LambdaCodePrefix,ParameterValue="${LAMBDA_CODE_PREFIX}" \
+              --capabilities CAPABILITY_IAM \
+              --region "${REGION}" || {
+                echo "No stack updates needed (or already up to date)"
+                exit 0
+              }
+
+            echo "Waiting for stack update..."
+            aws cloudformation wait stack-update-complete \
+              --stack-name "${STACK_NAME}" \
+              --region "${REGION}"
+          fi
+
+      - name: Display stack outputs
+        run: |
+          REGION="${{ steps.params.outputs.region }}"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${REGION}" \
+            --query 'Stacks[0].Outputs' \
+            --output table
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setting | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stack | ${STACK_NAME} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | ${{ steps.params.outputs.region }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| S3 Bucket | ${{ steps.params.outputs.s3_bucket }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Auto-Upgrade | ${{ steps.params.outputs.auto_upgrade }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Email | ${{ steps.params.outputs.email }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Next:** Confirm the SNS email subscription if this is a first deployment." >> "$GITHUB_STEP_SUMMARY"

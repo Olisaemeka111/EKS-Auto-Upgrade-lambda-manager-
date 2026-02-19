@@ -9,7 +9,7 @@ Pod Disruption Budgets (PDBs).
 import json
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 

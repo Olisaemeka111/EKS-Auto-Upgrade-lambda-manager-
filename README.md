@@ -32,10 +32,17 @@ This project provides automated management of Amazon EKS clusters, including:
 
 ![Architecture Diagram](./images/Amazon-EKS-Upgrade.png)
 
-The solution consists of two Lambda functions:
+### Two-Stack Design
+
+| Stack | Template | Purpose |
+|-------|----------|---------|
+| `eks-upgrade-bootstrap` | `cfn/initial-resources.yaml` | S3 bucket, OIDC provider, deployer IAM role |
+| `eks-addon-management` | `template.yaml` | Lambda functions, IAM roles, SNS, EventBridge schedules |
+
+### Lambda Functions
 
 1. **eks-version-checker** (Runs Fridays at 5 PM UTC)
-   - Checks cluster versions
+   - Checks cluster versions and upgrade readiness
    - Manages addon updates
    - Sends notifications
 
@@ -57,13 +64,60 @@ Production clusters are automatically skipped.
 ## Prerequisites
 
 1. AWS CLI installed and configured
-2. An S3 bucket for CloudFormation template upload
+2. IAM permissions to create CloudFormation stacks, Lambda, IAM roles, SNS, Scheduler, S3
 3. At least one EKS cluster tagged as development
-4. IAM permissions to create CloudFormation stacks, Lambda functions, IAM roles, SNS topics, and EventBridge schedules
 
 ## Quick Start
 
-### Option 1: Using the Deployment Script (Recommended)
+### Step 1: Deploy Bootstrap Infrastructure
+
+The bootstrap stack creates the S3 bucket, GitHub OIDC provider, and deployer IAM role. **This must be deployed first.**
+
+```bash
+aws cloudformation deploy \
+  --template-file cfn/initial-resources.yaml \
+  --stack-name eks-upgrade-bootstrap \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    GitHubOrg=YOUR-GITHUB-ORG \
+    GitHubRepo=automate-eks-upgrades \
+    Environment=dev
+```
+
+Retrieve the outputs:
+```bash
+aws cloudformation describe-stacks \
+  --stack-name eks-upgrade-bootstrap \
+  --query 'Stacks[0].Outputs'
+```
+
+See [docs/INITIAL_RESOURCES.md](./docs/INITIAL_RESOURCES.md) for full details.
+
+### Step 2: Deploy the Application
+
+#### Option A: GitHub Actions (Recommended)
+
+1. Fork/clone this repository
+2. Configure GitHub repository settings with the bootstrap stack outputs:
+
+   **Secrets:**
+   | Secret | Description |
+   |--------|-------------|
+   | `AWS_ROLE_ARN` | `DeployerRoleArn` from bootstrap stack |
+   | `AWS_ACCESS_KEY_ID` | IAM access key (for bootstrap job) |
+   | `AWS_SECRET_ACCESS_KEY` | IAM secret key (for bootstrap job) |
+   | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
+
+   **Variables:**
+   | Variable | Description |
+   |----------|-------------|
+   | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
+   | `S3_BUCKET` | `ArtifactBucketName` from bootstrap stack |
+   | `NOTIFICATION_EMAIL` | Email for SNS notifications |
+
+3. Push to `main` or trigger manually via **Actions > Deploy EKS Upgrade Automation > Run workflow**
+
+#### Option B: Deploy Script
 
 ```bash
 # Deploy with default settings (no auto-upgrade)
@@ -71,20 +125,35 @@ Production clusters are automatically skipped.
 
 # Deploy with auto-upgrade enabled
 ./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com true
+
+# Non-interactive mode (for CI/CD)
+./deploy.sh YOUR-BUCKET-NAME us-east-1 your-email@example.com false --non-interactive
 ```
 
-### Option 2: Manual Deployment
+#### Option C: Manual Deployment
 
-See [DEPLOYMENT.md](./docs/DEPLOYMENT.md) for detailed deployment instructions.
+See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) for detailed manual deployment instructions.
 
 ## Configuration
 
-### Parameters
+### Application Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `NotificationEmail` | Yes | - | Email address for SNS notifications |
 | `EnableAutoUpgrade` | No | `false` | Enable automatic upgrades for development clusters |
+| `LambdaCodeBucket` | Yes | - | S3 bucket containing Lambda code packages |
+| `LambdaCodePrefix` | No | `eks-addon-management/lambda` | S3 key prefix for Lambda code |
+
+### Bootstrap Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `GitHubOrg` | Yes | - | GitHub organization or username |
+| `GitHubRepo` | No | `automate-eks-upgrades` | GitHub repository name |
+| `Environment` | No | `dev` | Environment name |
+| `S3BucketName` | No | auto-generated | Explicit S3 bucket name |
+| `CreateOIDCProvider` | No | `true` | Set `false` if OIDC provider already exists |
 
 ### Tagging Development Clusters
 
@@ -122,12 +191,6 @@ You'll receive consolidated email notifications for:
 
 ## Troubleshooting
 
-### Template Size Error
-
-If you see "Member must have length less than or equal to 51200":
-- The template is 55,594 bytes and exceeds CloudFormation's inline limit
-- Solution: Upload to S3 first (see deployment instructions)
-
 ### Node Group Updates Failing
 
 If node group updates fail due to Pod Disruption Budgets:
@@ -149,19 +212,34 @@ Approximate monthly costs:
 - CloudWatch Logs: ~$0.50/month
 - SNS: ~$0.50/month
 - EventBridge Scheduler: Free tier
-- **Total: ~$1.20/month**
+- S3 (artifacts): ~$0.03/month
+- **Total: ~$1.23/month**
 
 Actual costs vary based on number of clusters, addons, and node groups.
 
-## Documentation
+## Project Structure
 
-- [DEPLOYMENT.md](./docs/DEPLOYMENT.md) - Detailed deployment guide
-- [code.py](./scripts/code.py) - Addon management Lambda source code
-- [nodegroup_code.py](./scripts/nodegroup_code.py) - Node group management Lambda source code
-- [template.yaml](template.yaml) - CloudFormation template
+```
+automate-eks-upgrades/
+  cfn/
+    initial-resources.yaml          # Bootstrap stack (S3, OIDC, deployer role)
+  iam/
+    deployer-policy.json            # Standalone deployer policy (for manual use)
+  scripts/
+    code.py                         # Cluster + addon management Lambda
+    nodegroup_code.py               # Node group management Lambda
+  docs/
+    INITIAL_RESOURCES.md            # Bootstrap infrastructure guide
+    DEPLOYMENT.md                   # Full deployment guide
+    QUICK_REFERENCE.md              # Quick reference card
+    PROJECT_DOCUMENTATION.md        # Full project technical docs
+  .github/workflows/
+    deploy.yml                      # Main CI/CD pipeline
+    predeploy.yml                   # Bootstrap reusable workflow
+  template.yaml                     # Application CloudFormation template
+  deploy.sh                         # CLI deployment script
+```
 
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-

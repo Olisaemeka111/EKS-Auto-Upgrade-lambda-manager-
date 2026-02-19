@@ -189,6 +189,18 @@ jobs:
             --query 'Stacks[0].StackStatus' \
             --output text 2>/dev/null || echo "DOES_NOT_EXIST")
 
+          # Clean up failed stack before re-creating
+          if [ "${STACK_STATUS}" = "ROLLBACK_COMPLETE" ] || [ "${STACK_STATUS}" = "CREATE_FAILED" ]; then
+            echo "Stack in ${STACK_STATUS} state, deleting before re-creating..."
+            aws cloudformation delete-stack \
+              --stack-name "${STACK_NAME}" \
+              --region "${REGION}"
+            aws cloudformation wait stack-delete-complete \
+              --stack-name "${STACK_NAME}" \
+              --region "${REGION}"
+            STACK_STATUS="DOES_NOT_EXIST"
+          fi
+
           if [ "${STACK_STATUS}" = "DOES_NOT_EXIST" ]; then
             echo "Creating new stack: ${STACK_NAME}"
             aws cloudformation create-stack \

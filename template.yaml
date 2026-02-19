@@ -86,7 +86,6 @@ Resources:
       Handler: code.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 120
-      ReservedConcurrentExecutions: 10
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref EKSUpgradeNotificationTopic
@@ -203,7 +202,6 @@ Resources:
       Handler: nodegroup_code.lambda_handler
       Role: !GetAtt NodeGroupLambdaExecutionRole.Arn
       Timeout: 300
-      ReservedConcurrentExecutions: 5
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref EKSUpgradeNotificationTopic

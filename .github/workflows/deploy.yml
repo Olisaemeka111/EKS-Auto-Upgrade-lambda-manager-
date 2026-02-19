@@ -113,11 +113,16 @@ jobs:
         run: |
           REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
 
-          # Prefer bucket from bootstrap, fall back to vars.S3_BUCKET
-          BOOTSTRAP_BUCKET="${{ needs.bootstrap.outputs.bucket-name }}"
-          if [ -n "$BOOTSTRAP_BUCKET" ] && [ "$BOOTSTRAP_BUCKET" != 'null' ] && [ "$BOOTSTRAP_BUCKET" != 'None' ]; then
-            S3_BUCKET="$BOOTSTRAP_BUCKET"
-          else
+          # Query the bootstrap stack directly for the S3 bucket name
+          # (workflow outputs get masked when secrets are passed to reusable workflows)
+          S3_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "eks-upgrade-bootstrap" \
+            --region "${REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucketName'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+
+          # Fall back to vars.S3_BUCKET if stack query fails
+          if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "None" ]; then
             S3_BUCKET="${{ vars.S3_BUCKET }}"
           fi
 

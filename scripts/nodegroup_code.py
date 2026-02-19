@@ -9,7 +9,7 @@ Pod Disruption Budgets (PDBs).
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 import boto3
 from botocore.exceptions import ClientError
 
@@ -48,7 +48,7 @@ def retry_with_backoff(func, *args, max_retries=3, **kwargs):
                     print(f"API throttled, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait_time)
                 else:
-                    print(f"Max retries reached for throttling")
+                    print("Max retries reached for throttling")
                     raise
             else:
                 raise
@@ -172,8 +172,7 @@ def update_nodegroup_version(
         
     except ClientError as e:
         error_message = str(e)
-        error_code = e.response.get('Error', {}).get('Code', '')
-        
+
         print(f"Failed to update node group {nodegroup_name}: {error_message}")
         
         return {
@@ -250,10 +249,10 @@ def send_nodegroup_summary(
             if 'PodEvictionFailure' in result['error'] or 'PDB' in result['error']:
                 message_lines.append("")
                 message_lines.append("  ACTION REQUIRED: If you want to force this update, run:")
-                message_lines.append(f"  aws eks update-nodegroup-version \\")
+                message_lines.append("  aws eks update-nodegroup-version \\")
                 message_lines.append(f"    --cluster-name {cluster_name} \\")
                 message_lines.append(f"    --nodegroup-name {result['nodegroup_name']} \\")
-                message_lines.append(f"    --force")
+                message_lines.append("    --force")
             
             message_lines.append("")
     
